@@ -7,16 +7,21 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/observer/ecsobserver/internal/ecsmock"
 )
@@ -261,3 +266,150 @@ func mustReadFile(t *testing.T, p string) []byte {
 }
 
 // Util End
+
+// newFileSDPayload returns a marshalled file_sd YAML payload with nTargets entries.
+// 1000 targets yields ~432 KiB (~108 pages), large enough that a reader woken by the
+// fsnotify event on the first write will arrive before all pages have been written.
+func newFileSDPayload(t *testing.T, nTargets int) []byte {
+	t.Helper()
+	targets := make([]fileSDTarget, nTargets)
+	for i := range targets {
+		targets[i] = fileSDTarget{
+			Targets: []string{fmt.Sprintf("10.0.%d.%d:9090", i/256, i%256)},
+			Labels: map[string]string{
+				"__meta_ecs_cluster_name":             "prod-cluster",
+				"__meta_ecs_container_name":           fmt.Sprintf("container-%d", i),
+				"__meta_ecs_task_definition_family":   fmt.Sprintf("task-family-%d", i),
+				"__meta_ecs_task_definition_revision": "42",
+				"__meta_ecs_task_group":               "service:my-service",
+				"__meta_ecs_task_launch_type":         "EC2",
+				"__meta_ecs_ec2_instance_id":          fmt.Sprintf("i-0abc%08d", i),
+				"__meta_ecs_ec2_instance_type":        "t3.medium",
+				"__meta_ecs_ec2_private_ip":           fmt.Sprintf("10.0.%d.%d", i/256, i%256),
+			},
+		}
+	}
+	b, err := yaml.Marshal(targets)
+	require.NoError(t, err)
+	return b
+}
+
+// watchForWrite sets up an fsnotify watcher on dir and returns a channel that receives
+// one event when any write or create event is observed for the given filename.
+func watchForWrite(t *testing.T, dir, filename string) <-chan struct{} {
+	t.Helper()
+	watcher, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	require.NoError(t, watcher.Add(dir))
+	t.Cleanup(func() { _ = watcher.Close() })
+
+	ch := make(chan struct{}, 1)
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if filepath.Base(event.Name) == filename &&
+					(event.Has(fsnotify.Write) || event.Has(fsnotify.Create)) {
+					select {
+					case ch <- struct{}{}:
+					default:
+					}
+				}
+			case _, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+			}
+		}
+	}()
+	return ch
+}
+
+// TestResultFileWritePartialRead proves that os.WriteFile produces a partial read when
+// a reader is woken by the fsnotify event fired during the write. The file is large
+// enough (~432 KiB, 108 pages) that the reader arrives before all pages are written.
+// This test is specific to Linux inotify semantics and skips on other platforms.
+func TestResultFileWritePartialRead(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("partial read race requires Linux inotify semantics")
+	}
+
+	const nTargets = 1000
+	dir := t.TempDir()
+	path := filepath.Join(dir, "targets.yml")
+	payload := newFileSDPayload(t, nTargets)
+
+	// Write an initial file so the watcher has something to watch.
+	require.NoError(t, os.WriteFile(path, payload, 0o600))
+
+	eventCh := watchForWrite(t, dir, filepath.Base(path))
+
+	// Write the large payload. The fsnotify event fires on the first write syscall,
+	// before all pages have been flushed. The reader opens the file at that point.
+	go func() {
+		require.NoError(t, os.WriteFile(path, payload, 0o600))
+	}()
+
+	// Wait for the fsnotify event, then read exactly as prometheus file_sd does.
+	select {
+	case <-eventCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for fsnotify event")
+	}
+
+	b, err := io.ReadAll(func() io.Reader {
+		f, err := os.Open(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = f.Close() })
+		return f
+	}())
+	require.NoError(t, err)
+
+	var result []fileSDTarget
+	parseErr := yaml.Unmarshal(b, &result)
+	// Either the read produced corrupt YAML (parse error) or fewer targets (silent truncation).
+	// Both prove the reader received partial data from the in-progress write.
+	if parseErr == nil {
+		assert.Less(t, len(result), nTargets,
+			"reader woken by fsnotify event got the full payload — expected partial read on Linux")
+	}
+}
+
+// TestResultFileWriteAtomic proves that writeResultFile eliminates partial reads.
+// The fsnotify event fires only after rename(2) completes, at which point the full
+// file is already in place. The reader always gets the complete payload.
+func TestResultFileWriteAtomic(t *testing.T) {
+	const nTargets = 1000
+	dir := t.TempDir()
+	path := filepath.Join(dir, "targets.yml")
+	payload := newFileSDPayload(t, nTargets)
+
+	require.NoError(t, writeResultFile(path, payload))
+
+	eventCh := watchForWrite(t, dir, filepath.Base(path))
+
+	go func() {
+		require.NoError(t, writeResultFile(path, payload))
+	}()
+
+	select {
+	case <-eventCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for fsnotify event")
+	}
+
+	b, err := io.ReadAll(func() io.Reader {
+		f, err := os.Open(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = f.Close() })
+		return f
+	}())
+	require.NoError(t, err)
+
+	var result []fileSDTarget
+	require.NoError(t, yaml.Unmarshal(b, &result))
+	assert.Equal(t, nTargets, len(result))
+}

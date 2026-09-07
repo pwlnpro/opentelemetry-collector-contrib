@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"go.uber.org/zap"
@@ -84,11 +85,31 @@ func (s *serviceDiscovery) runAndWriteFile(ctx context.Context) error {
 				return err
 			}
 			// NOTE: We assume the folder already exists and does NOT try to create one.
-			if err := os.WriteFile(s.cfg.ResultFile, b, 0o600); err != nil {
+			if err := writeResultFile(s.cfg.ResultFile, b); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+// writeResultFile atomically writes b to path via a temp file and rename.
+// os.CreateTemp creates the file with mode 0o600 (matching the legacy os.WriteFile
+// call), and os.Rename preserves that mode when moving it into place.
+func writeResultFile(path string, b []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".ecs_sd-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := f.Name()
+	defer func() { _ = os.Remove(tmpName) }() // no-op once renamed successfully
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // discover fetch tasks, filter by matching result and export them.
